@@ -7,6 +7,12 @@ from utils.database import insert_portfolio, insert_holdings, get_portfolio_by_i
 from utils.file_utils import allowed_file
 from utils.advisor_prompt import generate_advisor_prompt
 
+from utils.finance_functions import (
+    get_total_unrealized_gain_loss,
+    get_daily_change,
+    get_portfolio_weights
+)
+
 # Configure logging
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
@@ -52,7 +58,7 @@ def upload_portfolio():
             logger.error(f"Failed to decode file {filename} as UTF-8")
             return jsonify({"error": "File encoding error. Please ensure the file is UTF-8 encoded"}), 400
         
-        # Parse CSV using new parser
+        # Parse CSV using parser
         logger.info(f"Parsing CSV content for {filename}")
         parse_result = parse_portfolio_csv(csv_content, filename)
         
@@ -65,6 +71,27 @@ def upload_portfolio():
                 "warnings": parse_result['warnings']
             }), 400
         
+        # Analyze portfolio with finance functions
+        try:
+            logger.info(f"Analyzing portfolio with {len(parse_result['data'])} holdings")
+            
+            # Your csv_parser already returns the right format!
+            portfolio = parse_result['data']
+            
+            # Calculate the 3 metrics
+            gains = get_total_unrealized_gain_loss(portfolio)
+            daily = get_daily_change(portfolio)
+            weights = get_portfolio_weights(portfolio)
+            
+            logger.info(f"Portfolio analysis complete: Total value ${weights['total_portfolio_value']:,.2f}")
+            
+        except Exception as analysis_error:
+            logger.error(f"Portfolio analysis failed: {str(analysis_error)}")
+            # Continue with upload even if analysis fails
+            gains = None
+            daily = None
+            weights = None
+        
         # Save to database
         try:
             logger.info(f"Inserting portfolio for user {user_id}")
@@ -75,13 +102,27 @@ def upload_portfolio():
             
             logger.info(f"Successfully processed portfolio {portfolio_id} with {holdings_count} holdings")
             
-            return jsonify({
+            # NEW: Build response with analysis data
+            response = {
                 "message": "Portfolio uploaded and processed successfully",
                 "portfolio_id": portfolio_id,
                 "filename": filename,
                 "holdings_count": holdings_count,
                 "warnings": parse_result['warnings'] if parse_result['warnings'] else None
-            }), 200
+            }
+            
+            # Add analysis results if available
+            if gains and daily and weights:
+                response["analysis"] = {
+                    "total_value": weights['total_portfolio_value'],
+                    "total_gain_loss": gains['total_gain_loss'],
+                    "return_percentage": gains['percentage_return'],
+                    "daily_change_value": daily['daily_change_value'],
+                    "daily_change_percentage": daily['daily_change_percentage'],
+                    "holdings": weights['weights']  # Sorted by weight
+                }
+            
+            return jsonify(response), 200
             
         except Exception as db_error:
             logger.error(f"Database error during portfolio insertion: {str(db_error)}")
@@ -93,6 +134,59 @@ def upload_portfolio():
     except Exception as e:
         logger.error(f"Unexpected error during upload: {str(e)}")
         return jsonify({"error": f"Upload failed: {str(e)}"}), 500
+
+
+# Add endpoint to get fresh analysis for existing portfolio
+@api_bp.route("/portfolio/<int:portfolio_id>/analyze", methods=['GET'])
+def analyze_portfolio(portfolio_id):
+    """
+    Get fresh financial analysis for an existing portfolio.
+    Fetches current stock prices and calculates metrics.
+    """
+    try:
+        logger.info(f"Analyzing portfolio {portfolio_id}")
+        
+        # Get portfolio data
+        portfolio = get_portfolio_by_id(portfolio_id)
+        if not portfolio:
+            logger.warning(f"Portfolio {portfolio_id} not found")
+            return jsonify({"error": "Portfolio not found"}), 404
+        
+        # Get holdings from database
+        holdings = get_holdings_by_portfolio(portfolio_id)
+        
+        if not holdings:
+            return jsonify({"error": "No holdings found for this portfolio"}), 404
+        
+        # Run analysis with finance functions
+        gains = get_total_unrealized_gain_loss(holdings)
+        daily = get_daily_change(holdings)
+        weights = get_portfolio_weights(holdings)
+        
+        logger.info(f"Analysis complete for portfolio {portfolio_id}")
+        
+        return jsonify({
+            "portfolio_id": portfolio_id,
+            "portfolio_info": portfolio,
+            "analysis": {
+                "total_value": weights['total_portfolio_value'],
+                "total_gain_loss": gains['total_gain_loss'],
+                "total_cost_basis": gains['total_cost_basis'],
+                "return_percentage": gains['percentage_return'],
+                "daily_change_value": daily['daily_change_value'],
+                "daily_change_percentage": daily['daily_change_percentage']
+            },
+            "holdings": weights['weights'],
+            "details": {
+                "gains_by_stock": gains['details'],
+                "daily_changes_by_stock": daily['details']
+            }
+        }), 200
+        
+    except Exception as e:
+        logger.error(f"Error analyzing portfolio {portfolio_id}: {str(e)}")
+        return jsonify({"error": f"Analysis failed: {str(e)}"}), 500
+
 
 @api_bp.route("/portfolio/<int:portfolio_id>", methods=['GET'])
 def get_portfolio(portfolio_id):
